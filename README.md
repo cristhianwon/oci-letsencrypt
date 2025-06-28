@@ -19,7 +19,7 @@ For detailed install instructions see https://redthunder.blog/2022/10/14/managin
 
 ✨ **Contributed by [Cristhian Won](https://github.com/cristhianwon)**
 
-This new feature allows HTTP-01 certificate validation using a WAF policy, ideal for domains where you **don't control the DNS directly**, but you can point the domain to an OCI **Load Balancer public IP** and attach a **WAF policy**.
+This new feature **enables HTTP-01 certificate validation using a WAF policy**, which is ideal when **the DNS of the domain is managed by an external provider and you cannot request frequent updates**, as required by DNS-01. In this scenario, the external party can point the domain to your **OCI Load Balancer public IP**, and with a **WAF policy attached**, the challenge response can be handled dynamically without further DNS changes.
 
 ### 📝 Requirements
 
