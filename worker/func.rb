@@ -135,7 +135,7 @@ def update_waf(cert_config, cn_name, challenge)
   ## add the challenge to the WAF policy as an access control
   waf_policy.actions ||= []
   waf_policy.actions << OCI::Waf::Models::ReturnHttpResponseAction.new(
-    name: ("challenge-le-action-#{cn_name.start_with?('*.') ? cn_name[2..-1] : cn_name}").gsub('.', '-'),
+    name: ("challenge-le-action-#{cn_name.start_with?('*.') ? cn_name[2..-1] : cn_name}-#{Time.now.to_i}").gsub('.', '-'),
     code: 200,
     headers: [
       OCI::Waf::Models::ResponseHeader.new(
@@ -151,13 +151,13 @@ def update_waf(cert_config, cn_name, challenge)
   default_action = waf_policy.request_access_control&.default_action_name
   # add the access control rule to the WAF policy
   waf_policy.request_access_control ||= OCI::Waf::Models::RequestAccessControl.new(
-    default_action_name: default_action || ("le-challenge-action-#{cn_name.start_with?('*.') ? cn_name[2..-1] : cn_name}").gsub('.', '-'),
+    default_action_name: default_action || ("le-challenge-action-#{cn_name.start_with?('*.') ? cn_name[2..-1] : cn_name}-#{Time.now.to_i}").gsub('.', '-'),
     rules: []
   )
   waf_policy.request_access_control.rules << OCI::Waf::Models::AccessControlRule.new(
     type: 'ACCESS_CONTROL',
-    name: ("le-challenge-rule-#{cn_name.start_with?('*.') ? cn_name[2..-1] : cn_name}").gsub('.', '-'),
-    action_name: ("challenge-le-action-#{cn_name.start_with?('*.') ? cn_name[2..-1] : cn_name}").gsub('.', '-'),
+    name: ("le-challenge-rule-#{cn_name.start_with?('*.') ? cn_name[2..-1] : cn_name}-#{Time.now.to_i}").gsub('.', '-'),
+    action_name: ("challenge-le-action-#{cn_name.start_with?('*.') ? cn_name[2..-1] : cn_name}-#{Time.now.to_i}").gsub('.', '-'),
     condition_language: 'JMESPATH',
     condition: "i_equals(http.request.host, '#{cn_name.start_with?('*.') ? cn_name[2..-1] : cn_name}') && i_equals(http.request.url.path, '/.well-known/acme-challenge/#{challenge.token}')"
   )
