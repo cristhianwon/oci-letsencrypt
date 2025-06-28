@@ -12,6 +12,7 @@ require 'oci/functions/functions'
 require 'oci/object_storage/object_storage'
 require 'oci/vault/vault'
 require 'oci/secrets/secrets'
+require 'oci/waf/waf'
 require 'openssl'
 require 'acme-client'
 require 'open-uri'
@@ -125,6 +126,50 @@ def update_dns(cert_config, cn_name, challenge)
   dns_client.patch_domain_records(cert_config['dns_zone_name'], "#{challenge.record_name}.#{cn_name.start_with?('*.') ? cn_name[2..-1] : cn_name}", zone_update)
 end
 
+#update WAF with the LE challenge value
+def update_waf(cert_config, cn_name, challenge)
+  waf_client = OCI::Waf::WafClient.new(signer: get_signer, region: cert_config['waf_region'])
+  # get WAF Policy by ocid
+  waf_policy = waf_client.get_web_app_firewall_policy(cert_config['waf_ocid']).data
+  # update the WAF policy with the challenge add the action and access control rule
+  ## add the challenge to the WAF policy as an access control
+  waf_policy.actions ||= []
+  waf_policy.actions << OCI::Waf::Models::ReturnHttpResponseAction.new(
+    name: ("challenge-le-action-#{cn_name.start_with?('*.') ? cn_name[2..-1] : cn_name}").gsub('.', '-'),
+    code: 200,
+    headers: [
+      OCI::Waf::Models::ResponseHeader.new(
+        name: 'Content-Type',
+        value: challenge.content_type
+      )
+    ],
+    body: OCI::Waf::Models::StaticTextHttpResponseBody.new(
+      text: challenge.file_content
+    )
+  )
+  # search default action name
+  default_action = waf_policy.request_access_control&.default_action_name
+  # add the access control rule to the WAF policy
+  waf_policy.request_access_control ||= OCI::Waf::Models::RequestAccessControl.new(
+    default_action_name: default_action || ("le-challenge-action-#{cn_name.start_with?('*.') ? cn_name[2..-1] : cn_name}").gsub('.', '-'),
+    rules: []
+  )
+  waf_policy.request_access_control.rules << OCI::Waf::Models::AccessControlRule.new(
+    type: 'ACCESS_CONTROL',
+    name: ("le-challenge-rule-#{cn_name.start_with?('*.') ? cn_name[2..-1] : cn_name}").gsub('.', '-'),
+    action_name: ("challenge-le-action-#{cn_name.start_with?('*.') ? cn_name[2..-1] : cn_name}").gsub('.', '-'),
+    condition_language: 'JMESPATH',
+    condition: "i_equals(http.request.host, '#{cn_name.start_with?('*.') ? cn_name[2..-1] : cn_name}') && i_equals(http.request.url.path, '/.well-known/acme-challenge/#{challenge.token}')"
+  )
+  waf_client.update_web_app_firewall_policy(
+    cert_config['waf_ocid'],
+    OCI::Waf::Models::UpdateWebAppFirewallPolicyDetails.new(
+      actions: waf_policy.actions,
+      request_access_control: waf_policy.request_access_control
+    )
+  )
+end
+
 #create keys, and request cert from Let's Encrypt
 def exec_cert_bot(cert_config, existing_cert)
 
@@ -142,9 +187,15 @@ def exec_cert_bot(cert_config, existing_cert)
   challenges = []
   order = client.new_order(identifiers: identifiers)
   order.authorizations.each_with_index do |authorization, idx|
-     challenge = authorization.dns
-     update_dns(cert_config, identifiers[idx], challenge)
-     challenges << challenge
+    if cert_config['dns_region'].nil? || cert_config['dns_zone_name'].nil?
+      challenge = authorization.http
+      update_waf(cert_config, identifiers[idx], challenge)
+      challenges << challenge
+    else
+      challenge = authorization.dns
+      update_dns(cert_config, identifiers[idx], challenge)
+      challenges << challenge
+    end
   end
 
   sleep(120) #wait 2 minutes while DNS propagates to prevent premature failure
