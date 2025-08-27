@@ -104,70 +104,102 @@ end
 
 #update DNS zone with the LE challenge value
 def update_dns(cert_config, cn_name, challenge)
-  dns_client = OCI::Dns::DnsClient.new(signer: get_signer, region: cert_config['dns_region'])
-  dns_zone = []
-  dns_client.get_zone_records(cert_config['dns_zone_name']).each do |resp|
-    dns_zone  += resp.data.items
-  end
+  retries = 0
+  # try catch for error like "Invalid transition, resource is currently being modified."
+  while retries < 5
+    begin
+      dns_client = OCI::Dns::DnsClient.new(signer: get_signer, region: cert_config['dns_region'])
+      dns_zone = []
+      dns_client.get_zone_records(cert_config['dns_zone_name']).each do |resp|
+        dns_zone  += resp.data.items
+      end
 
-  records_to_update = []
-  existing_zone = dns_zone.select{|r| r.domain == "#{challenge.record_name}.#{cn_name.start_with?('*.') ? cn_name[2..-1] : cn_name}"}.first
+      records_to_update = []
+      existing_zone = dns_zone.select{|r| r.domain == "#{challenge.record_name}.#{cn_name.start_with?('*.') ? cn_name[2..-1] : cn_name}"}.first
 
-  if !existing_zone.nil?
-    records_to_update << OCI::Dns::Models::RecordOperation.new(operation: 'REMOVE',
-                                                               domain: "#{challenge.record_name}.#{cn_name.start_with?('*.') ? cn_name[2..-1] : cn_name}")
+      if !existing_zone.nil?
+        records_to_update << OCI::Dns::Models::RecordOperation.new(operation: 'REMOVE',
+                                                                  domain: "#{challenge.record_name}.#{cn_name.start_with?('*.') ? cn_name[2..-1] : cn_name}")
+      end
+      records_to_update << OCI::Dns::Models::RecordOperation.new(operation: 'ADD',
+                                                                domain: "#{challenge.record_name}.#{cn_name.start_with?('*.') ? cn_name[2..-1] : cn_name}",
+                                                                rdata: challenge.record_content,
+                                                                rtype: challenge.record_type,
+                                                                ttl: 30)
+      zone_update = OCI::Dns::Models::PatchDomainRecordsDetails.new(items: records_to_update)
+      dns_client.patch_domain_records(cert_config['dns_zone_name'], "#{challenge.record_name}.#{cn_name.start_with?('*.') ? cn_name[2..-1] : cn_name}", zone_update)
+      break
+    rescue StandardError => e
+      retries += 1
+      sleep(30)
+      FDK.log(entry: "Retrying DNS update due to error: #{e.message}")
+      # if after 5 retries, log and exit
+      if retries >= 5
+        FDK.log(entry: "Failed to update DNS after 5 retries: #{e.message}")
+        raise
+      end
+    end
   end
-  records_to_update << OCI::Dns::Models::RecordOperation.new(operation: 'ADD',
-                                                             domain: "#{challenge.record_name}.#{cn_name.start_with?('*.') ? cn_name[2..-1] : cn_name}",
-                                                             rdata: challenge.record_content,
-                                                             rtype: challenge.record_type,
-                                                             ttl: 30)
-  zone_update = OCI::Dns::Models::PatchDomainRecordsDetails.new(items: records_to_update)
-  dns_client.patch_domain_records(cert_config['dns_zone_name'], "#{challenge.record_name}.#{cn_name.start_with?('*.') ? cn_name[2..-1] : cn_name}", zone_update)
 end
 
 #update WAF with the LE challenge value
 def update_waf(cert_config, cn_name, challenge)
-  waf_client = OCI::Waf::WafClient.new(signer: get_signer, region: cert_config['waf_region'])
-  # get WAF Policy by ocid
-  waf_policy = waf_client.get_web_app_firewall_policy(cert_config['waf_ocid']).data
-  # update the WAF policy with the challenge add the action and access control rule
-  ## add the challenge to the WAF policy as an access control
-  waf_policy.actions ||= []
-  waf_policy.actions << OCI::Waf::Models::ReturnHttpResponseAction.new(
-    name: ("challenge-le-action-#{cn_name.start_with?('*.') ? cn_name[2..-1] : cn_name}-#{Time.now.to_i}").gsub('.', '-'),
-    code: 200,
-    headers: [
-      OCI::Waf::Models::ResponseHeader.new(
-        name: 'Content-Type',
-        value: challenge.content_type
+  retries = 0
+  # try catch for error like "Invalid transition, resource is currently being modified."
+  while retries < 5
+    begin
+      waf_client = OCI::Waf::WafClient.new(signer: get_signer, region: cert_config['waf_region'])
+      # get WAF Policy by ocid
+      waf_policy = waf_client.get_web_app_firewall_policy(cert_config['waf_ocid']).data
+      # update the WAF policy with the challenge add the action and access control rule
+      ## add the challenge to the WAF policy as an access control
+      waf_policy.actions ||= []
+      waf_policy.actions << OCI::Waf::Models::ReturnHttpResponseAction.new(
+        name: ("challenge-le-action-#{cn_name.start_with?('*.') ? cn_name[2..-1] : cn_name}-#{Time.now.to_i}").gsub('.', '-'),
+        code: 200,
+        headers: [
+          OCI::Waf::Models::ResponseHeader.new(
+            name: 'Content-Type',
+            value: challenge.content_type
+          )
+        ],
+        body: OCI::Waf::Models::StaticTextHttpResponseBody.new(
+          text: challenge.file_content
+        )
       )
-    ],
-    body: OCI::Waf::Models::StaticTextHttpResponseBody.new(
-      text: challenge.file_content
-    )
-  )
-  # search default action name
-  default_action = waf_policy.request_access_control&.default_action_name
-  # add the access control rule to the WAF policy
-  waf_policy.request_access_control ||= OCI::Waf::Models::RequestAccessControl.new(
-    default_action_name: default_action || ("le-challenge-action-#{cn_name.start_with?('*.') ? cn_name[2..-1] : cn_name}-#{Time.now.to_i}").gsub('.', '-'),
-    rules: []
-  )
-  waf_policy.request_access_control.rules << OCI::Waf::Models::AccessControlRule.new(
-    type: 'ACCESS_CONTROL',
-    name: ("le-challenge-rule-#{cn_name.start_with?('*.') ? cn_name[2..-1] : cn_name}-#{Time.now.to_i}").gsub('.', '-'),
-    action_name: ("challenge-le-action-#{cn_name.start_with?('*.') ? cn_name[2..-1] : cn_name}-#{Time.now.to_i}").gsub('.', '-'),
-    condition_language: 'JMESPATH',
-    condition: "i_equals(http.request.host, '#{cn_name.start_with?('*.') ? cn_name[2..-1] : cn_name}') && i_equals(http.request.url.path, '/.well-known/acme-challenge/#{challenge.token}')"
-  )
-  waf_client.update_web_app_firewall_policy(
-    cert_config['waf_ocid'],
-    OCI::Waf::Models::UpdateWebAppFirewallPolicyDetails.new(
-      actions: waf_policy.actions,
-      request_access_control: waf_policy.request_access_control
-    )
-  )
+      # search default action name
+      default_action = waf_policy.request_access_control&.default_action_name
+      # add the access control rule to the WAF policy
+      waf_policy.request_access_control ||= OCI::Waf::Models::RequestAccessControl.new(
+        default_action_name: default_action || ("le-challenge-action-#{cn_name.start_with?('*.') ? cn_name[2..-1] : cn_name}-#{Time.now.to_i}").gsub('.', '-'),
+        rules: []
+      )
+      waf_policy.request_access_control.rules << OCI::Waf::Models::AccessControlRule.new(
+        type: 'ACCESS_CONTROL',
+        name: ("le-challenge-rule-#{cn_name.start_with?('*.') ? cn_name[2..-1] : cn_name}-#{Time.now.to_i}").gsub('.', '-'),
+        action_name: ("challenge-le-action-#{cn_name.start_with?('*.') ? cn_name[2..-1] : cn_name}-#{Time.now.to_i}").gsub('.', '-'),
+        condition_language: 'JMESPATH',
+        condition: "i_equals(http.request.host, '#{cn_name.start_with?('*.') ? cn_name[2..-1] : cn_name}') && i_equals(http.request.url.path, '/.well-known/acme-challenge/#{challenge.token}')"
+      )
+      waf_client.update_web_app_firewall_policy(
+        cert_config['waf_ocid'],
+        OCI::Waf::Models::UpdateWebAppFirewallPolicyDetails.new(
+          actions: waf_policy.actions,
+          request_access_control: waf_policy.request_access_control
+        )
+      )
+      break
+    rescue StandardError => e
+      retries += 1
+      sleep(30)
+      FDK.log(entry: "Retrying WAF update due to error: #{e.message}")
+      # if after 5 retries, log and exit
+      if retries >= 5
+        FDK.log(entry: "Failed to update WAF after 5 retries: #{e.message}")
+        raise
+      end
+    end
+  end
 end
 
 #create keys, and request cert from Let's Encrypt
@@ -222,12 +254,27 @@ def exec_cert_bot(cert_config, existing_cert)
   new_cert = OpenSSL::X509::Certificate.new(order.certificate)
   new_server_cert_chain = retrieve_cert_chain(new_cert).join if has_ca_issuer_uris?(new_cert)
 
-  if existing_cert.nil?
-    created_cert = add_cert(cert_config, new_cert.to_pem, new_server_cert_chain, cert_private_key.to_pem)
-    log_action(created_cert, "Creating new cert for #{cert_config['cn_name']} valid to #{new_cert.not_after.strftime('%Y-%m-%d')}")
-  else
-    update_cert(cert_config, existing_cert, new_cert.to_pem, new_server_cert_chain, cert_private_key.to_pem)
-    log_action(existing_cert, "Updating cert #{cert_config['cn_name']} valid to #{new_cert.not_after.strftime('%Y-%m-%d')}")
+  retries = 0
+  while retries < 5
+    begin
+      if existing_cert.nil?
+        created_cert = add_cert(cert_config, new_cert.to_pem, new_server_cert_chain, cert_private_key.to_pem)
+        log_action(created_cert, "Creating new cert for #{cert_config['cn_name']} valid to #{new_cert.not_after.strftime('%Y-%m-%d')}")
+      else
+        update_cert(cert_config, existing_cert, new_cert.to_pem, new_server_cert_chain, cert_private_key.to_pem)
+        log_action(existing_cert, "Updating cert #{cert_config['cn_name']} valid to #{new_cert.not_after.strftime('%Y-%m-%d')}")
+      end
+      break
+    rescue StandardError => e
+      retries += 1
+      sleep(30)
+      FDK.log(entry: "Retrying cert update due to error: #{e.message}")
+      # if after 5 retries, log and exit
+      if retries >= 5
+        FDK.log(entry: "Failed to update cert after 5 retries: #{e.message}")
+        raise
+      end
+    end
   end
   "Completed Successfully"
 end
