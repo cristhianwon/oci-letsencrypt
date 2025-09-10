@@ -132,12 +132,12 @@ def update_dns(cert_config, cn_name, challenge)
     rescue StandardError => e
       retries += 1
       sleep(30)
-      FDK.log(entry: "Retrying DNS update due to error: #{e.message}")
       # if after 5 retries, log and exit
       if retries >= 5
-        FDK.log(entry: "Failed to update DNS after 5 retries: #{e.message}")
+        FDK.log(entry: "[domain: #{cn_name}] Failed to update DNS after 5 retries: #{e.message} on attempt #{retries}")
         raise
       end
+      FDK.log(entry: "[domain: #{cn_name}] Retrying DNS update due to error: #{e.message} on attempt #{retries}")
     end
   end
 end
@@ -192,12 +192,12 @@ def update_waf(cert_config, cn_name, challenge)
     rescue StandardError => e
       retries += 1
       sleep(30)
-      FDK.log(entry: "Retrying WAF update due to error: #{e.message}")
       # if after 5 retries, log and exit
       if retries >= 5
-        FDK.log(entry: "Failed to update WAF after 5 retries: #{e.message}")
+        FDK.log(entry: "[domain: #{cn_name}] Failed to update WAF after 5 retries: #{e.message} on attempt #{retries}")
         raise
       end
+      FDK.log(entry: "[domain: #{cn_name}] Retrying WAF update due to error: #{e.message} on attempt #{retries}")
     end
   end
 end
@@ -211,13 +211,18 @@ def exec_cert_bot(cert_config, existing_cert)
     add_lets_encrypt_acc_key(cert_config, acc_private_key)
   end
 
-  client = Acme::Client.new(private_key: acc_private_key, directory: LE_ENDPOINT_URI)
-  account = client.new_account(contact: CERT_CONTACT, terms_of_service_agreed: true)
-  account.kid
+  begin
+    client = Acme::Client.new(private_key: acc_private_key, directory: LE_ENDPOINT_URI)
+    account = client.new_account(contact: CERT_CONTACT, terms_of_service_agreed: true)
+    account.kid
+    identifiers = [cert_config['cn_name']] + cert_config['alt_names']
+    challenges = []
+    order = client.new_order(identifiers: identifiers)
+  rescue StandardError => e
+    FDK.log(entry: "[domain: #{cert_config['cn_name']}] Failed to create Let's Encrypt account: #{e.message}")
+    raise
+  end
 
-  identifiers = [cert_config['cn_name']] + cert_config['alt_names']
-  challenges = []
-  order = client.new_order(identifiers: identifiers)
   order.authorizations.each_with_index do |authorization, idx|
     if cert_config['dns_region'].nil? || cert_config['dns_zone_name'].nil?
       challenge = authorization.http
@@ -230,50 +235,57 @@ def exec_cert_bot(cert_config, existing_cert)
     end
   end
 
-  sleep(120) #wait 2 minutes while DNS propagates to prevent premature failure
+  FDK.log(entry: "[domain: #{cert_config['cn_name']}] Waiting 1.5 minutes while DNS propagates to prevent premature failure")
+  sleep(90) #wait 1.5 minutes while DNS propagates to prevent premature failure
 
-  challenges.each{|challenge| challenge.request_validation}
-  while challenges.map{|challenge| challenge.status}.include?('pending')
-    sleep(4)
-    challenges.each{|challenge| challenge.reload}
+  begin
+    challenges.each{|challenge| challenge.request_validation}
+    while challenges.map{|challenge| challenge.status}.include?('pending')
+      sleep(4)
+      challenges.each{|challenge| challenge.reload}
+    end
+
+    if challenges.map{|challenge| challenge.status}.include?('invalid')
+      FDK.log(entry: "[domain: #{cert_config['cn_name']}] One or more DNS challenges failed")
+    end
+
+    FDK.log(entry: "[domain: #{cert_config['cn_name']}] Creating certificate request")
+    cert_private_key = OpenSSL::PKey::RSA.new(4096)
+    csr = Acme::Client::CertificateRequest.new(private_key: cert_private_key, subject: { common_name: cert_config['cn_name']},  names: cert_config['alt_names'])
+    order.finalize(csr: csr)
+    while order.status == 'processing'
+      sleep(1)
+      order.reload
+    end
+
+    FDK.log(entry: "[domain: #{cert_config['cn_name']}] Retrieving certificate chain")
+    new_cert = OpenSSL::X509::Certificate.new(order.certificate)
+    new_server_cert_chain = retrieve_cert_chain(new_cert).join if has_ca_issuer_uris?(new_cert)
+  rescue StandardError => e
+    FDK.log(entry: "[domain: #{cert_config['cn_name']}] Failed to retrieve certificate chain: #{e.message}")
+    raise
   end
-
-  if challenges.map{|challenge| challenge.status}.include?('invalid')
-    FDK.log(entry: "One or more DNS challenges failed for #{cert_config['cn_name']}")
-  end
-
-  cert_private_key = OpenSSL::PKey::RSA.new(4096)
-  csr = Acme::Client::CertificateRequest.new(private_key: cert_private_key, subject: { common_name: cert_config['cn_name']},  names: cert_config['alt_names'])
-  order.finalize(csr: csr)
-  while order.status == 'processing'
-    sleep(1)
-    order.reload
-  end
-
-
-  new_cert = OpenSSL::X509::Certificate.new(order.certificate)
-  new_server_cert_chain = retrieve_cert_chain(new_cert).join if has_ca_issuer_uris?(new_cert)
 
   retries = 0
   while retries < 5
     begin
       if existing_cert.nil?
         created_cert = add_cert(cert_config, new_cert.to_pem, new_server_cert_chain, cert_private_key.to_pem)
-        log_action(created_cert, "Creating new cert for #{cert_config['cn_name']} valid to #{new_cert.not_after.strftime('%Y-%m-%d')}")
+        log_action(created_cert, "[domain: #{cert_config['cn_name']}] Creating new cert, valid to #{new_cert.not_after.strftime('%Y-%m-%d')}")
       else
         update_cert(cert_config, existing_cert, new_cert.to_pem, new_server_cert_chain, cert_private_key.to_pem)
-        log_action(existing_cert, "Updating cert #{cert_config['cn_name']} valid to #{new_cert.not_after.strftime('%Y-%m-%d')}")
+        log_action(existing_cert, "[domain: #{cert_config['cn_name']}] Updating cert, valid to #{new_cert.not_after.strftime('%Y-%m-%d')}")
       end
       break
     rescue StandardError => e
       retries += 1
       sleep(30)
-      FDK.log(entry: "Retrying cert update due to error: #{e.message}")
       # if after 5 retries, log and exit
       if retries >= 5
-        FDK.log(entry: "Failed to update cert after 5 retries: #{e.message}")
+        FDK.log(entry: "[domain: #{cert_config['cn_name']}] Failed to update cert after 5 retries: #{e.message} on attempt #{retries}")
         raise
       end
+      FDK.log(entry: "[domain: #{cert_config['cn_name']}] Retrying cert update due to error: #{e.message} on attempt #{retries}")
     end
   end
   "Completed Successfully"
@@ -366,11 +378,12 @@ def run_function(context:, input:)
   if !cert.nil?
     latest_cert = cert_client.list_certificate_versions(cert.id, sort_order: 'DESC').data.items.first
     if !(Time.now + (cert_config['renew_days_before_expiry']*86400) > latest_cert.validity.time_of_validity_not_after.to_time)
-      log_action(cert, "Certificate #{cert_config['cn_name']} does not need to be renewed")
+      log_action(cert, "[domain: #{cert_config['cn_name']}] Certificate does not need to be renewed, expires on #{latest_cert.validity.time_of_validity_not_after.to_time}")
       return "Nothing to do"
     end
   end
 
+  FDK.log(entry: "[domain: #{cert_config['cn_name']}] Certificate needs to be renewed")
   exec_cert_bot(cert_config, cert)
 end
 
