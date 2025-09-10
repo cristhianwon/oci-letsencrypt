@@ -145,42 +145,46 @@ end
 #update WAF with the LE challenge value
 def update_waf(cert_config, cn_name, challenge)
   retries = 0
-  # try catch for error like "Invalid transition, resource is currently being modified."
   while retries < 5
     begin
       waf_client = OCI::Waf::WafClient.new(signer: get_signer, region: cert_config['waf_region'])
-      # get WAF Policy by ocid
       waf_policy = waf_client.get_web_app_firewall_policy(cert_config['waf_ocid']).data
-      # update the WAF policy with the challenge add the action and access control rule
-      ## add the challenge to the WAF policy as an access control
+
       waf_policy.actions ||= []
-      waf_policy.actions << OCI::Waf::Models::ReturnHttpResponseAction.new(
-        name: ("challenge-le-action-#{cn_name.start_with?('*.') ? cn_name[2..-1] : cn_name}-#{Time.now.to_i}").gsub('.', '-'),
-        code: 200,
-        headers: [
-          OCI::Waf::Models::ResponseHeader.new(
-            name: 'Content-Type',
-            value: challenge.content_type
+      action_name = ("challenge-le-action-#{cn_name.start_with?('*.') ? cn_name[2..-1] : cn_name}-#{Time.now.to_i}").gsub('.', '-')
+      waf_policy.actions.unshift(
+        OCI::Waf::Models::ReturnHttpResponseAction.new(
+          name: action_name,
+          code: 200,
+          headers: [
+            OCI::Waf::Models::ResponseHeader.new(
+              name: 'Content-Type',
+              value: challenge.content_type
+            )
+          ],
+          body: OCI::Waf::Models::StaticTextHttpResponseBody.new(
+            text: challenge.file_content
           )
-        ],
-        body: OCI::Waf::Models::StaticTextHttpResponseBody.new(
-          text: challenge.file_content
         )
       )
-      # search default action name
+
       default_action = waf_policy.request_access_control&.default_action_name
-      # add the access control rule to the WAF policy
       waf_policy.request_access_control ||= OCI::Waf::Models::RequestAccessControl.new(
         default_action_name: default_action || ("le-challenge-action-#{cn_name.start_with?('*.') ? cn_name[2..-1] : cn_name}-#{Time.now.to_i}").gsub('.', '-'),
         rules: []
       )
-      waf_policy.request_access_control.rules << OCI::Waf::Models::AccessControlRule.new(
-        type: 'ACCESS_CONTROL',
-        name: ("le-challenge-rule-#{cn_name.start_with?('*.') ? cn_name[2..-1] : cn_name}-#{Time.now.to_i}").gsub('.', '-'),
-        action_name: ("challenge-le-action-#{cn_name.start_with?('*.') ? cn_name[2..-1] : cn_name}-#{Time.now.to_i}").gsub('.', '-'),
-        condition_language: 'JMESPATH',
-        condition: "i_equals(http.request.host, '#{cn_name.start_with?('*.') ? cn_name[2..-1] : cn_name}') && i_equals(http.request.url.path, '/.well-known/acme-challenge/#{challenge.token}')"
+
+      rule_name = ("le-challenge-rule-#{cn_name.start_with?('*.') ? cn_name[2..-1] : cn_name}-#{Time.now.to_i}").gsub('.', '-')
+      waf_policy.request_access_control.rules.unshift(
+        OCI::Waf::Models::AccessControlRule.new(
+          type: 'ACCESS_CONTROL',
+          name: rule_name,
+          action_name: action_name,
+          condition_language: 'JMESPATH',
+          condition: "i_equals(http.request.host, '#{cn_name.start_with?('*.') ? cn_name[2..-1] : cn_name}') && i_equals(http.request.url.path, '/.well-known/acme-challenge/#{challenge.token}')"
+        )
       )
+
       waf_client.update_web_app_firewall_policy(
         cert_config['waf_ocid'],
         OCI::Waf::Models::UpdateWebAppFirewallPolicyDetails.new(
@@ -192,7 +196,6 @@ def update_waf(cert_config, cn_name, challenge)
     rescue StandardError => e
       retries += 1
       sleep(30)
-      # if after 5 retries, log and exit
       if retries >= 5
         FDK.log(entry: "[domain: #{cn_name}] Failed to update WAF after 5 retries: #{e.message} on attempt #{retries}")
         raise
